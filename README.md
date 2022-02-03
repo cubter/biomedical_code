@@ -1,4 +1,4 @@
-# biomedical_code
+# Biomedical code
 
-Here lies all the stuff related to extracting & analyzing data from 
+Here lies all the stuff related to extracting & analyzing the data from 
 various biomedical ontology systems.
