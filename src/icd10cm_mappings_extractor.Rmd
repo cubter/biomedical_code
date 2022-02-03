@@ -1,0 +1,161 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r include=FALSE}
+library(httr)
+library(purrr)
+library(magrittr)
+library(jsonlite)
+```
+
+Your API key here
+```{r}
+api_key = ""
+base_url = "https://data.bioontology.org/ontologies/ICD10CM/mappings?apikey="
+suffix = "&pagesize=1000"
+url = paste0(base_url, api_key, suffix, collapse = "")
+```
+
+
+```{r}
+resp = GET(url)
+resp_parsed = resp$content %>% 
+    rawToChar() %>%
+    parse_json()
+
+num_pages = resp_parsed$pageCount
+```
+
+
+```{r}
+retrieve_id <- function(self_url, ontology_url) {
+    if (ontology_url %>% stringr::str_detect("MEDDRA")) {
+        second_ontology_id <- ontology_url %>% 
+            stringr::str_remove( "http://purl.bioontology.org/ontology/MEDDRA/")
+        
+        names(second_ontology_id) = "MEDDRA"
+        
+         self_id = self_url %>% 
+            stringr::str_remove("http://purl.bioontology.org/ontology/ICD10CM/")
+    } else if (ontology_url %>% stringr::str_detect("ICD10\\/")) {
+        second_ontology_id <- ontology_url %>% 
+            stringr::str_remove( "http://purl.bioontology.org/ontology/ICD10/")
+        
+        names(second_ontology_id) = "ICD10"
+        
+        self_id = self_url %>% 
+            stringr::str_remove("http://purl.bioontology.org/ontology/ICD10CM/")
+    } else {
+        self_id = NULL
+        second_ontology_id = NULL
+    }
+    out = c(self_id, second_ontology_id)
+    
+    return(out)
+}
+
+refine_mappings <- function(mapping_elem) {
+    if (is.null(mapping_elem)) {
+        return(NULL)
+    }
+    
+    icd10cm_code = mapping_elem[[1]]
+    
+    if (names(mapping_elem)[2] == "MEDDRA")
+        ontology = "meddra"
+    else
+        ontology = "icd10"
+    
+    index = map_lgl(1:length(mapping_list),
+                    ~ mapping_list[[.x]][[1]] == icd10cm_code) %>% 
+        which()
+    
+    if (!is_empty(index)) {
+        curr_val = mapping_list[[index]][[ontology]]
+        
+        # If the elem is already present under the current index, skip
+        if (map_lgl(curr_val, ~ .x == mapping_elem[[2]]) %>% which() %>% 
+            is_empty() %>% not())  {
+            return(NULL)
+        }
+        
+        # If the curr. mapping is empty, initialize it with a new value
+        if (curr_val[1] == "") {
+            mapping_list[[index]][[ontology]] <<- mapping_elem[[2]]
+        # else append
+        } else  {
+            mapping_list[[index]][[ontology]] <<- 
+                append(mapping_list[[index]][[ontology]], mapping_elem[[2]])
+        }
+    # else if the ICD10CM code is new, create new mapping element
+    } else {
+        mapping_list[[length(mapping_list) + 1]] <<- 
+            list(icd10cm = icd10cm_code, meddra = "", icd10 = "")
+        
+        mapping_list[[length(mapping_list)]][[ontology]] <<- mapping_elem[[2]]
+    }
+
+}
+
+retrieve_mappings <- function(url, counter) {
+    url = url %>% paste0(., "&page=", counter, collapse = "")
+    
+    cat("fetching URL: ", url)
+    
+    resp = GET(url)
+    
+    if (resp$status_code != 200) 
+        return(NULL)
+    
+    cat(", status code: ", resp$status_code, "\n")
+    
+    content = resp$content %>% 
+        rawToChar() %>%
+        parse_json()
+    
+    mappings = map(content$collection,
+                   ~ retrieve_id(.x$classes[[1]]$`@id`, .x$classes[[2]]$`@id`))
+    
+    map(mappings, refine_mappings)
+    
+    write(paste(url, resp$status_code, sep = ",   code: "), 
+          "bioportal_mappings_query_log.txt")
+    
+    write(toJSON(mapping_list, pretty = T, auto_unbox = T), 
+          "icd10cm_mappings.json")
+}
+```
+
+
+```{r}
+mapping_list <- list(list(icd10cm = "", meddra = "", icd10 = ""))
+
+map(1:num_pages, ~ retrieve_mappings(url, .x))
+```
+
+
+WARNING: Use the code block below ONLY IF something suddenly crashed during previous 
+requests 
+```{r}
+mapping_list <- read_json("icd10cm_mappings.json")
+
+unlist_mappings <- function(mapping_elem) {
+    mapping_elem[[2]] %<>% unlist()
+    mapping_elem[[3]] %<>% unlist()
+    return(mapping_elem)
+}
+
+mapping_list %<>% map(., unlist_mappings)
+
+last_successful_page = readLines("/home/user/Data/bioportal_mappings_query_log.txt")
+last_successful_page <- last_successful_page %>% 
+    stringr::str_extract("page=\\d{1,}") %>% 
+    stringr::str_remove("page=")
+
+map((last_successful_page + 1):num_pages, ~ retrieve_mappings(url, .x))
+```
+```
+
+
