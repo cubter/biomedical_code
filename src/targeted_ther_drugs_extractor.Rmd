@@ -1,0 +1,409 @@
+---
+title: "R Notebook"
+output: html_notebook
+summary: the script obtains the list of targeted therapy drugs from Bioportal's NCIT ontology 
+TODO: add checking the drugs and groups files from prev. download and calculating diffs, keeping the established IDs intact.
+---
+
+```{r include=FALSE}
+library(curl)
+library(httr)
+library(purrr)
+library(magrittr)
+library(jsonlite)
+library(stringr)
+library(openssl)
+```
+
+Provide your own API key here
+```{r}
+api_key = ""
+targ_ther_drugs_tbl_name <- "dict.targeted_therapy_drugs"
+targ_ther_groups_tbl_name <- "dict.targeted_therapy_groups"
+```
+
+Fetching Bioportal's NCIT to retrieve targeted therapy graphs
+```{r}
+targ_ther <- GET(paste0("https://data.bioontology.org/ontologies/NCIT/classes/http%3A%2F%2Fncicb.nci.nih.gov%2Fxml%2Fowl%2FEVS%2FThesaurus.owl%23C163758/children?apikey=", 
+                        api_key, 
+                        collapse = "")
+                 )
+
+if (targ_ther$status_code == 200) {
+        targ_ther <- targ_ther$content %>%
+        rawToChar() %>% 
+        parse_json()
+} else {
+    cat("Error during fetching Bioportal. Code:", targ_ther$status_code)
+}
+```
+
+
+Retrieving drugs' paths traversing the graphs
+```{r}
+process_child_url <- function(url) {
+    cat("Processing URL:", url)
+    
+    resp <- GET(paste0(url, "?apikey=", api_key,
+                       collapse = "")
+                )
+    
+    cat("  DONE", "\n")
+    
+    return(resp)
+}
+
+retrieve_children <- function(node, api_key, parent_node_preflabel) {
+    if (node$totalCount == 0) {
+        return(parent_node_preflabel)   
+    }
+    
+    node$collection <- node$collection
+    
+    # Children names
+    node_collection_preflabels <- node$collection %>% 
+        map_chr(., ~ .x$prefLabel) 
+    # Term's synonyms
+    node_collection_synonyms <- map_chr(node$collection, 
+                                        ~ paste0(.x$synonym, collapse = ";"))
+    node_collection_preflabels <- map2_chr(node_collection_preflabels,
+                                           node_collection_synonyms,
+                                           ~ paste(.x, .y, sep = ";"))
+    
+    # Adding children names to paths
+    node_hierarchy <- map_chr(node_collection_preflabels,
+                              ~ paste(parent_node_preflabel, .x, sep = "|")
+                              )
+    
+    # Fetching children links
+    children_urls <- node$collection %>% map_chr(., ~ .x$links$children)
+    
+    children <- map(children_urls, process_child_url)
+    
+    children <- map(children, ~ .x$content %>%
+                        rawToChar() %>%
+                        parse_json())
+
+    children %<>% map2(., node_hierarchy, 
+                       ~ retrieve_children(.x, api_key, .y)
+                       )
+}
+
+root_preflabel <- "Targeted Therapy Agent"
+
+drug_paths <- retrieve_children(targ_ther, api_key, root_preflabel)
+drug_paths %<>% unlist(., recursive = T)
+```
+
+
+```{r}
+drug_graphs <- list()
+
+for (i in seq_along(drug_paths)) {
+    node = strsplit(drug_paths[i], "\\|")
+    subnodes = strsplit(node[[1]], "\\;")
+    
+    for (j in seq_along(subnodes)) {
+        names(subnodes)[j] = subnodes[1]
+    }
+    
+    drug_graphs[[i]] = subnodes
+}
+```
+
+
+```{r}
+remove_names_duplicates <- function(node) {
+    group_names <- node[1:length(node) - 1] %>% 
+        unlist(use.names = F) %>% 
+        tolower() %>% 
+        unique() %>% 
+        extract(1:2)
+    
+    group_names %<>% extract(
+        group_names %>%
+            is.na() %>% 
+            not() %>% 
+            which()
+        )
+    
+    drug_names <- node[[length(node)]] %>% 
+        tolower() %>% 
+        unique() %>% 
+        extract(1:3)
+    
+    drug_names %<>% extract(
+        drug_names %>%
+            is.na() %>% 
+            not() %>% 
+            which()
+        )
+    
+    drug_names %<>% str_replace_all("'", '"')
+    
+    out <- list(group_names, drug_names)
+    
+    return(out)
+}
+
+drugs_graphs %<>% map(., function(x) { 
+    x[[1]] <- NULL
+    return(x)
+    })
+
+drugs_graphs %<>% map(remove_names_duplicates)
+```
+
+Retrieve drugs and their groups producing two sep. lists
+```{r}
+drugs <- drugs_graphs %>% map(., function(x) { 
+    if (length(x[[length(x)]]) < 2) {
+        return(x[[length(x)]])
+    } else {
+        return(x[[length(x)]][1:2])
+    }
+    })
+
+extract_groups <- function (node) {
+    if (length(node) == 2) {
+        out <- "no group"
+    } else if (length(node) == 3) {
+        out <- node[[2]][1] %>% tolower() %>% unique()
+    } else {
+        out <- map_chr(2:(length(node) - 1), ~ node[[.x]][1] %>% 
+                           tolower() %>% 
+                           unique())
+    }
+    
+    return(out)
+}
+
+groups <- tree %>% map(., extract_groups)
+```
+
+Groups within the targeted therapy class are of hierarchical structure. The group 
+hierarchy graphs are constructed here.
+```{r}
+groups_hierarchy <- list()
+
+retrieve_groups <- function(group_node) {
+    if (group_node[1] == "no groups") return()
+    
+    i = 1
+    while(!is.na(group_node[i])) {
+        row_num <- (names(groups_hierarchy) %in% group_node[i]) %>% 
+            which()
+        
+        if (!is_empty(row_num)) {
+            if (!is.na(group_node[i + 1])) { 
+                # Existing children
+                chd             <- groups_hierarchy[[row_num]][[3]]
+                chd_position    <- match(group_node[i + 1], chd)
+                                
+                # If the current group's child is new, append it
+                if (is.na(chd_position)) {
+                     chd %<>% append(group_node[i + 1])
+                     groups_hierarchy[[row_num]][[3]] <<- chd
+                }
+                
+                # Searching the child within the already added nodes 
+                chd_index = match(group_node[i + 1], names(groups_hierarchy))
+                
+                # Setting the node as its child's parent 
+                if (!is.na(chd_index)) {
+                    groups_hierarchy[[chd_index]][[2]] <<- 
+                        append(groups_hierarchy[[chd_index]][[2]], group_node[i])
+                } else {
+                    groups_hierarchy[[length(groups_hierarchy) + 1]] <<-
+                        vector("list", 3L)
+                    new_len                             <- length(groups_hierarchy)
+                    groups_hierarchy[[new_len]][[1]]    <<- group_node[i + 1]
+                    names(groups_hierarchy)[new_len]    <<- group_node[i + 1]
+                    groups_hierarchy[[new_len]][[2]]    <<- group_node[i]
+                }
+            }
+        
+            i = i + 1
+            next
+        }  
+        
+        cat(group_node[i], "new\n")
+        groups_hierarchy[[length(groups_hierarchy) + 1]]    <<- vector("list", 3L)
+        new_len                                             <- length(groups_hierarchy)
+        groups_hierarchy[[new_len]][[1]]                    <<- group_node[i]
+        names(groups_hierarchy)[new_len]                    <<- group_node[i]
+        
+        # If the node has children, add them
+        if (!is.na(group_node[i + 1])) { 
+            groups_hierarchy[[length(groups_hierarchy)]][[3]] <<- 
+                group_node[i + 1]
+            
+            chd_index = match(group_node[i + 1], names(groups_hierarchy))
+                                
+            # Setting the node as its child's parent 
+            if (!is.na(chd_index)) {
+                groups_hierarchy[[chd_index]][[2]] <<- 
+                    append(groups_hierarchy[[chd_index]][[2]], group_node[i])
+            } else {
+                groups_hierarchy[[length(groups_hierarchy) + 1]] <<-
+                    vector("list", 3L)
+                
+                new_len = length(groups_hierarchy)
+                groups_hierarchy[[new_len]][[1]]    <<- group_node[i + 1]
+                names(groups_hierarchy)[new_len]    <<- group_node[i + 1]
+                groups_hierarchy[[new_len]][[2]]    <<- group_node[i]
+            }
+        }
+        
+        i = i + 1
+    }
+}
+
+out <- map(groups, retrieve_groups)
+rm(out)
+
+# Cleaning node's parents and children removing duplicates
+groups_hierarchy %<>% map(., ~ map(.x, ~ .x %<>% unique()))
+
+groups_hierarchy[[groups_hierarchy %>% 
+                     map_lgl(~ .x[[1]] == 'no group') %>% 
+                     which()]] <- NULL
+```
+
+Producing SQL queries for the groups table
+```{r}
+# YOUR CURRENT MAX CONCEPT'S ID (FROM THE dict.concepts table) MUST BE HERE. 
+# PLEASE, REPLACE THE VALUE OR YOU MAY GET ERRORS WHEN EXECUTING THE QUERY LATER
+start_id <- 4270938 # current max. concept's ID + 1    
+names(groups_hierarchy) = start_id:(start_id + length(groups_hierarchy) - 1)
+
+produce_groups_sql_query <- function(node, id) {
+    out <- list()
+    grp_name <- paste0("'", node[[1]], "'", collapse = "")
+    out <- out %>% append(id) %>% append(grp_name)
+    
+    i = 1
+    for (i in 2:length(node)) {
+        if (!is_empty(node[[i]])) {
+            arr <- node[[i]] %>% 
+                paste0("'", ., "'", collapse = ", ") %>% 
+                paste0("ARRAY [", ., "]", collapse = " ")
+        } else {
+            arr <- node[[i]] %>% 
+                paste0("ARRAY [", ., "]::varchar[]", collapse = " ")
+        }
+        out %<>% append(arr)
+    }
+    
+    out <- out %>% 
+        paste0(., collapse = ", ") %>% 
+        paste0("(", ., ")", collapse = " ")
+    
+    return(out)
+}
+
+groups_sql_queries <- map2(groups_hierarchy, 
+                           start_id:(start_id + length(groups_hierarchy) - 1),
+                           produce_groups_sql_query)
+groups_sql_queries %<>% paste0(collapse = ",\n")
+groups_sql_queries %<>% paste0("insert into ", targ_ther_groups_tbl_name, " values\n", .,
+                               collapse = " ")
+```
+
+Writing groups SQL queries to file
+```{r}
+curr_time <- format(Sys.time(), "%d-%b-%Y-%H:%M")
+
+write(groups_sql_queries, 
+      file = paste0("/home/user/Data/targ_ther_groups_", 
+                    curr_time, ".sql", collapse = "")
+      )
+```
+
+
+Matching drugs' groups with their IDs
+```{r}
+unique_groups <- groups %>% 
+    unlist() %>%
+    unique()
+
+group_names <- unique_groups
+group_ids   <- start_id:(start_id + length(unique_groups) - 1)
+group_mapping  <- data.frame(id = group_ids,
+                             name = group_names)
+
+assign_group_id <- function(grp_node, groups_ids) {
+    grp_node <- map_int(grp_node, ~ groups_ids[match(.x, groups_ids[, 2]), 1])
+    return(grp_node)
+}
+
+groups %<>% map(., ~ assign_group_id(.x, groups_ids))
+```
+
+Removing duplicates from drugs
+```{r}
+duplicates <- vector("logical", length(drugs))
+
+for (i in seq_along(drugs)) {
+    if (i < 2) next
+    
+    drug_index = -1
+    
+    for (j in seq_along(drugs[1:(i - 1)])) {
+        if (drugs[[j]][1] == drugs[[i]][1]) {
+            drug_index = j
+            break
+        }
+    }
+    group_index <- groups[[i]][1] %in% groups[drug_index]
+    
+    if (drug_index != -1 && isTRUE(group_index)) {
+        duplicates[i] <- TRUE
+    } else if (drug_index != -1 && !isTRUE(group_index)) {
+        groups[[drug_index]] %<>% append(., groups[[i]])
+        groups[[drug_index]] %<>% unique()
+        duplicates[i] <- TRUE
+    }
+}
+
+drugs %<>% .[duplicates %>% not() %>% which()]
+groups %<>% .[duplicates %>% not() %>% which()]
+```
+
+
+```{r}
+produce_drugs_sql_query <- function(drug_node, group_node) {
+    drug_arr <- drug_node %>% 
+        paste("'", ., "'",
+              sep = "", collapse = ", ") %>% 
+        paste0("ARRAY [", ., "]", collapse = "")
+    
+    if (is.na(group_node[1])) {
+        group_arr <- "ARRAY []::integer[]"
+    } else {
+        group_arr <- group_node %>% 
+        paste0(collapse = ", ") %>% 
+        paste0("ARRAY [", ., "]", collapse = "")   
+    }
+    
+    out <- paste0("(", drug_arr, ", ", group_arr, ")",
+                  collapse = " ")
+}
+
+targ_ther_drugs_sql <- map2(drugs, groups, produce_drugs_sql_query)
+targ_ther_drugs_sql <- targ_ther_drugs_sql %>% 
+    paste0(collapse = ",\n") %>% 
+    paste0("insert into", targ_ther_drugs_tbl_name, "(drug_aliases, drug_groups) values\n", .,
+           collapse = "")
+```
+
+
+```{r}
+curr_time <- format(Sys.time(), "%d-%b-%Y-%H:%M")
+
+write(targ_ther_drugs_sql, 
+      file = paste0("/home/user/Data/targ_ther_drugs_", 
+                    curr_time, ".sql", collapse = "")
+      )
+```
+
