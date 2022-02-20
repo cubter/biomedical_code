@@ -1,0 +1,3 @@
+username: 
+db_name: 
+host_addr: 
